@@ -1,0 +1,260 @@
+// OCP_USER must be set as a parameter to this pipeline
+// Set up Namespaces
+def namespaceDev  = "${OCP_USER}-dev-coffeeshop"
+def namespaceProd = "${OCP_USER}-prod-coffeeshop"
+
+// Set up Nexus Image Registry credentials
+def nexusRegistryUser     = "admin"
+def nexusRegistryPassword = "redhat"
+
+// Set up dev/prod tag place holders
+def devTag    = "dev-YYYY-MM-DD-HH-MM-SS"
+def prodTag   = "prod-YYYY-MM-DD-HH-MM-SS"
+
+pipeline {
+  agent {
+    kubernetes {
+      cloud 'openshift'
+      yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: jenkins
+  containers:
+  - name: jnlp
+    image: image-registry.openshift-image-registry.svc:5000/openshift/jenkins-agent-base:latest
+    command:
+    args: ['\${computer.jnlpmac}', '\${computer.name}']
+    workingDir: /tmp
+    tty: false
+  - name: maven
+    image: image-registry.openshift-image-registry.svc:5000/openshift/openjdk-11-rhel8:1.0
+    command:
+    - cat
+    tty: true
+    resources:
+      requests:
+        memory: 2Gi
+        cpu: 1
+  - name: skopeo
+    image: quay.io/skopeo/stable:v1.2.0
+    command:
+    - cat
+    tty: true
+    resources:
+      requests:
+        memory: 128Mi
+        cpu: 100m
+"""
+    }
+  }
+
+  stages {
+    stage('Checkout source code') {
+      steps {
+        git credentialsId: "${OCP_USER}-jenkins-repo-secret",
+            url: "${SOURCE_GIT_URL}",
+            branch: "${SOURCE_GIT_BRANCH}"
+        script{
+          // Calculate the current time stamp
+          def buildTimeStamp = sh(script: "date +'%Y-%m-%d-%H-%M-%S'", returnStdout: true).trim()
+
+          // Update image tags based on current time stamp
+          devTag  = "dev-"+buildTimeStamp
+          prodTag = "prod-"+buildTimeStamp
+        }
+      }
+    }
+
+    stage('Build jar file') {
+      steps {
+        dir("${SOURCE_GIT_CONTEXT_DIR}") {
+          container("maven") {
+            sh "mvn -s ../nexus_settings_openshift.xml clean package -DskipTests=true"
+          }
+        }
+      }
+    }
+
+    stage('Build and tag container image') {
+      steps {
+        echo "Building container image ${APP_NAME}:${devTag}"
+    
+        dir("${SOURCE_GIT_CONTEXT_DIR}") {
+          // Start Binary Build in OpenShift using the file we just published
+          // The filename is ${APP_NAME}-1.0-SNAPSHOT-runner.jar in the 'target'
+          // directory of your current Jenkins workspace
+          script {
+            openshift.withCluster() {
+              openshift.withProject("${namespaceDev}") {
+                def devBuildConfig = openshift.selector("bc", "${APP_NAME}").startBuild("--from-file=./target/${APP_NAME}-1.0-SNAPSHOT-runner.jar", "--wait=true")
+    
+                // Retrieve build logs
+                devBuildConfig.logs("-f")
+    
+                echo "Tagging image ${APP_NAME}:${devTag}"
+                openshift.tag("${APP_NAME}:latest", "${APP_NAME}:${devTag}")
+              }
+            }
+          }
+        }
+      }
+    }
+
+    stage('Deploy to development project (Deployment)') {
+      when {
+        environment name: 'DEPLOY_SERVERLESS', value: 'false'
+      }
+      steps {
+        echo "Deploying container image to development project ${namespaceDev}"
+    
+        script {
+          openshift.withCluster() {
+            openshift.withProject("${namespaceDev}") {
+    
+              def devDeployment = openshift.selector("deploy", "${APP_NAME}").object()
+              devDeployment.spec.template.spec.containers[0].image="image-registry.openshift-image-registry.svc:5000/${namespaceDev}/${APP_NAME}:${devTag}"
+    
+              openshift.apply(devDeployment)
+            }
+          }
+        }
+        // OpenShift plugin does not support rollout().restart()
+        // and rollout().status()
+        // Use OpenShift CLI in a shell instead
+        // Trigger deployment
+        sh(script: "oc rollout restart deployment ${APP_NAME} -n ${namespaceDev}")
+    
+        // Wait for deployment to be successful
+        sh(script: "oc rollout status deployment ${APP_NAME} -n ${namespaceDev}")
+      }
+    }
+
+    stage('Deploy to development project (Serverless)') {
+      when {
+        environment name: 'DEPLOY_SERVERLESS', value: 'true'
+      }
+      steps {
+        echo "Deploying container image to development project ${namespaceDev}"
+    
+        script {
+          openshift.withCluster() {
+            openshift.withProject("${namespaceDev}") {
+    
+              def devService = openshift.selector("service.serving.knative.dev", "${APP_NAME}").object()
+    
+              // Save current version in a variable before writing
+              // changes back to the cluster
+              def currentVersion = devService.status.observedGeneration
+    
+              devService.spec.template.spec.containers[0].image="image-registry.openshift-image-registry.svc:5000/${namespaceDev}/${APP_NAME}:${devTag}"
+              devService.spec.template.metadata.name = "${APP_NAME}-${devTag}"
+    
+              // Write the changes back to the Cluster
+              openshift.apply(devService)
+    
+              // Wait until observedGeneration has increased.
+              while (devService.status.observedGeneration == currentVersion) {
+                sleep 1
+                devService = openshift.selector("service.serving.knative.dev", "${APP_NAME}").object()
+              }
+            }
+          }
+        }
+      }
+    }
+
+    stage('Tag container image for production') {
+      steps {
+        script {
+          openshift.withCluster() {
+            openshift.withProject("${namespaceDev}") {
+              openshift.tag("${APP_NAME}:${devTag}", "${APP_NAME}:${prodTag}")
+            }
+          }
+        }
+      }
+    }
+
+    stage('Publish production image to Nexus container registry') {
+      steps {
+        echo "Publish production image to Nexus container registry"
+        script {
+          // Run this oc command on the default jnlp container
+          // to have access to the oc cli
+          def openshift_token = sh([ script: 'oc whoami -t', returnStdout: true ]).trim()
+
+          container("skopeo") {
+            sh "skopeo copy --src-tls-verify=false --dest-tls-verify=false --src-creds openshift:${openshift_token} --dest-creds ${nexusRegistryUser}:${nexusRegistryPassword} docker://image-registry.openshift-image-registry.svc.cluster.local:5000/${namespaceDev}/${APP_NAME}:${prodTag} docker://nexus-registry.nexus.svc.cluster.local:5000/${OCP_USER}-${APP_NAME}:${prodTag}"
+          }
+        }
+      }
+    }
+
+    stage('Deploy to production project (Deployment)') {
+      when {
+        environment name: 'DEPLOY_SERVERLESS', value: 'false'
+      }
+      steps {
+        echo "Deploying container image to production project ${namespaceProd}"
+    
+        script {
+          openshift.withCluster() {
+            openshift.withProject("${namespaceProd}") {
+              def prodDeployment = openshift.selector("deploy", "${APP_NAME}").object()
+              // Set image - MUST use route for Nexus
+              echo "Setting image to nexus-registry-nexus.${CLUSTER_DOMAIN}/${OCP_USER}-${APP_NAME}:${prodTag}"
+    
+              prodDeployment.spec.template.spec.containers[0].image="nexus-registry-nexus.${CLUSTER_DOMAIN}/${OCP_USER}-${APP_NAME}:${prodTag}"
+    
+              openshift.apply(prodDeployment)
+            }
+          }
+        }
+        // OpenShift plugin does not support rollout().restart()
+        // and rollout().status()
+        // Use OpenShift CLI in a shell instead
+        // Trigger deployment
+        sh(script: "oc rollout restart deployment ${APP_NAME} -n ${namespaceProd}")
+    
+        // Wait for deployment to be successful
+        sh(script: "oc rollout status deployment ${APP_NAME} -n ${namespaceProd}")
+      }
+    }
+
+    stage('Deploy to production project (Serverless)') {
+      when {
+        environment name: 'DEPLOY_SERVERLESS', value: 'true'
+      }
+      steps {
+        echo "Deploying container image to production project ${namespaceProd}"
+    
+        script {
+          openshift.withCluster() {
+            openshift.withProject("${namespaceProd}") {
+    
+              def prodService = openshift.selector("service.serving.knative.dev", "${APP_NAME}").object()
+    
+              // Save current version in a variable before writing
+              // changes back to the cluster
+              def currentVersion = prodService.status.observedGeneration
+    
+              prodService.spec.template.spec.containers[0].image="nexus-registry-nexus.${CLUSTER_DOMAIN}/${OCP_USER}-${APP_NAME}:${prodTag}"
+    
+              prodService.spec.template.metadata.name = "${APP_NAME}-${prodTag}"
+    
+              // Write the changes back to the Cluster
+              openshift.apply(prodService)
+    
+              // Wait until observedGeneration has increased.
+              while (prodService.status.observedGeneration == currentVersion) {
+                sleep 1
+                prodService = openshift.selector("service.serving.knative.dev", "${APP_NAME}").object()
+              }
+            }
+          }
+        }
+      }
+    }
+  } // Stages
+} // Pipeline
